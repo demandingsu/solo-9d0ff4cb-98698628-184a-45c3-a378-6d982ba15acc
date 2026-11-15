@@ -25,6 +25,7 @@ REASON_MISSING = "missing_hour"
 REASON_UNRECORDED = "unrecorded_meter_change"
 REASON_REGRESSION = "meter_regression"
 REASON_CONFLICT = "boundary_conflict"
+REASON_CROSS_METER = "cross_meter_conflict"
 
 INSTANCE = os.environ.get("INSTANCE_NAME") or socket.gethostname()
 
@@ -153,10 +154,46 @@ def compute_day(conn, mp: str, day: date) -> dict:
             "end": fmt_ts(hours[i + 1]),
             "meter": meter,
             "delta_kwh": _num(delta),
-            "status": "ok" if not reasons else "pending",
             "reasons": reasons,
-            "detail": "；".join(details) if details else None,
+            "details": details,
         })
+
+    # ---- 跨点串表核查（同一已提交快照）：本点使用中的表号在其它计量点的
+    # 有效计量段若与本日内的小时区间正长度重叠，则该小时不得给确定用量 ----
+    cross_conflicts: list[dict] = []
+    day_meters = {m for m in (inc["meter"] for inc in increments) if m}
+    if day_meters:
+        from .segments import (REASON_CROSS_METER as _RCM, affected_dates,
+                                build_segments, find_cross_meter_conflicts)
+        window_segments = build_segments(
+            conn, mp=None, lo=fmt_ts(t0), hi=fmt_ts(t1),
+            meters=day_meters,
+        )
+        conflict_records = find_cross_meter_conflicts(window_segments)
+        for rec in conflict_records:
+            if day.isoformat() not in affected_dates(rec["start"], rec["end"]):
+                continue
+            other_mps = [x for x in rec["metering_points"] if x != mp]
+            cross_conflicts.append(rec)
+            for inc in increments:
+                ov_start = max(inc["start"], rec["start"])
+                ov_end = min(inc["end"], rec["end"])
+                if ov_start < ov_end:
+                    detail = (
+                        f"表 {rec['meter']} 在 {ov_start}–{ov_end} 同时登记于计量点 "
+                        f"{mp} 与 {', '.join(other_mps)}，跨点串表待核"
+                        f"（来源: {', '.join(sorted({s['source_name'] or str(s['import_id']) for s in rec['sources']}))}）"
+                    )
+                    if _RCM not in inc["reasons"]:
+                        inc["reasons"].append(_RCM)
+                    if detail not in inc["details"]:
+                        inc["details"].append(detail)
+                    # 串表小时用量归属未定：不参与确定用量（known_kwh 只统计 ok 增量）
+                    inc["delta_kwh"] = None
+
+    for inc in increments:
+        inc["status"] = "ok" if not inc["reasons"] else "pending"
+        inc["detail"] = "；".join(inc["details"]) if inc["details"] else None
 
     # 相邻待核增量合并为待核区间
     pending_intervals: list[dict] = []
@@ -169,16 +206,15 @@ def compute_day(conn, mp: str, day: date) -> dict:
             for r in inc["reasons"]:
                 if r not in iv["reasons"]:
                     iv["reasons"].append(r)
-            if inc["detail"]:
-                for d in inc["detail"].split("；"):
-                    if d not in iv["details"]:
-                        iv["details"].append(d)
+            for d in inc["details"]:
+                if d not in iv["details"]:
+                    iv["details"].append(d)
         else:
             pending_intervals.append({
                 "start": inc["start"],
                 "end": inc["end"],
                 "reasons": list(inc["reasons"]),
-                "details": [inc["detail"]] if inc["detail"] else [],
+                "details": list(inc["details"]),
             })
 
     known = sum(
@@ -198,11 +234,12 @@ def compute_day(conn, mp: str, day: date) -> dict:
         "mp": mp,
         "date": day.isoformat(),
         "status": status,
-        # 有待核区间时不给确定日总量
+        # 有待核区间（含跨点串表）时不给确定日总量
         "total_kwh": None if pending_intervals else _num(known),
         "known_kwh": _num(known),
         "pending_intervals": pending_intervals,
         "increments": increments,
+        "cross_meter_conflicts": cross_conflicts,
         "snapshot": snapshot,
         "instance": INSTANCE,
         "computed_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ"),

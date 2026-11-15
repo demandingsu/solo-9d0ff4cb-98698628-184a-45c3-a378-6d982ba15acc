@@ -2,14 +2,16 @@
 
 - POST /api/imports/readings        导入读数 CSV（计量点,表号,UTC整点,累计kWh）
 - POST /api/imports/meter-changes   导入换表单 CSV（可迟到，补录后重算受影响日期）
-- GET  /api/settlement/daily        单计量点单日核算（待核区间 / 确定日总量）
+- GET  /api/settlement/daily        单计量点单日核算（待核区间 / 确定日总量，含跨点串表待核）
 - GET  /api/settlement/range        日期区间核算（同一已提交快照）
+- GET  /api/meter-cross-checks      跨点串表核查（同表号不同计量点的有效计量段重叠）
+- GET  /api/meter-segments          有效计量段与来源查看（核查判定依据）
 - GET  /api/metering-points|readings|meter-changes|imports  数据查看
 - GET  /api/health                  健康检查
 
-一致性：导入单事务原子提交（失败整体回滚，已有结果不变）；核算在只读事务内
-完成，WAL 快照保证一次核算只读同一已提交状态。核算按需实时计算，补录换表单
-后直接重新查询受影响日期即得重算结果。
+一致性：导入单事务原子提交（失败整体回滚，已有结果不变）；核算与跨点核查均在
+只读事务内完成，WAL 快照保证一次判定只读同一已提交状态（本点用量与跨点冲突共用
+同一快照）。核算按需实时计算，补录读数或单据后重新查询即按当前数据重新判断。
 """
 from __future__ import annotations
 
@@ -26,6 +28,8 @@ from . import db
 from .calc import HOUR, INSTANCE, compute_day, fmt_ts
 from .parsing import (ChangeRow, CsvError, ReadingRow, parse_meter_changes_csv,
                       parse_readings_csv)
+from .segments import (affected_dates, build_segments,
+                        find_cross_meter_conflicts, snapshot_info)
 
 
 @asynccontextmanager
@@ -36,10 +40,11 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="园区能源日用电量核算 API",
-    version="1.0.0",
+    version="1.1.0",
     description=(
         "逐小时电表累计读数 → 计量点日用电量（UTC 日界）。支持换表单（含迟到补录）、"
-        "缺整点/无单据换表/同表倒退/边界读数冲突时返回待核区间。"
+        "缺整点/无单据换表/同表倒退/边界读数冲突时返回待核区间，"
+        "并提供跨点串表核查（同表号在不同计量点的有效计量段重叠 → 相关日核算待核）。"
         "样例数据见仓库 samples/，演示脚本见 scripts/demo.sh。"
     ),
     lifespan=lifespan,
@@ -243,6 +248,82 @@ def settlement_range(
         conn.close()
 
 
+# ---------------------------------------------------------------- 跨点串表核查
+
+@app.get("/api/meter-cross-checks", summary="跨点串表核查：同表号在不同计量点的重叠时段")
+def meter_cross_checks(
+    mp: str | None = Query(None, min_length=1, max_length=64, description="只看涉及该计量点的冲突"),
+    meter: str | None = Query(None, min_length=1, max_length=64, description="只看该表号"),
+    from_: date_type | None = Query(None, alias="from", description="起始日期 (UTC)，默认全部数据"),
+    to: date_type | None = Query(None, description="截止日期 (UTC)，含当日"),
+):
+    """依据相邻整点读数与换表边界形成的有效计量段，返回同表号跨计量点的重叠冲突。
+
+    - 仅正长度时段重叠才算冲突；同一表号先后在两个点使用、计量段仅端点相接不报。
+    - 缺整点处计量段断开，不推定占用。
+    - 每条冲突给出重叠时段、涉及计量点、参与计量段以及读数/单据来源（含导入批次）。
+    - 与日核算一样在单个只读事务内完成，使用同一已提交快照。
+    """
+    lo = fmt_ts(datetime.combine(from_, time.min)) if from_ else None
+    hi = fmt_ts(datetime.combine(to + timedelta(days=1), time.min)) if to else None
+    conn = db.connect()
+    try:
+        conn.execute("BEGIN")  # 与核算相同：只读事务内读同一已提交快照
+        try:
+            segments = build_segments(conn, mp=None, meter=meter, lo=lo, hi=hi)
+            conflicts = find_cross_meter_conflicts(segments)
+            snap = snapshot_info(conn)
+        finally:
+            conn.execute("COMMIT")
+    finally:
+        conn.close()
+
+    if mp:
+        conflicts = [c for c in conflicts if mp in c["metering_points"]]
+    for c in conflicts:
+        c["affected_dates"] = affected_dates(c["start"], c["end"])
+    return {
+        "status": "conflict" if conflicts else "ok",
+        "conflict_count": len(conflicts),
+        "conflicts": conflicts,
+        "filters": {"mp": mp, "meter": meter, "from": from_.isoformat() if from_ else None,
+                    "to": to.isoformat() if to else None},
+        "snapshot": snap,
+        "instance": INSTANCE,
+    }
+
+
+@app.get("/api/meter-segments", summary="有效计量段查看（跨点串表核查的判定依据）")
+def meter_segments(
+    mp: str | None = Query(None, min_length=1, max_length=64, description="计量点（可选）"),
+    meter: str | None = Query(None, min_length=1, max_length=64, description="表号（可选）"),
+    from_: date_type | None = Query(None, alias="from"),
+    to: date_type | None = Query(None),
+):
+    """返回各 (计量点, 表号) 的有效计量段及每个边界整点的读数/单据来源。
+
+    缺整点会断段；段端点相接但不重叠不构成串表。可用本端点核对核查结论。
+    """
+    lo = fmt_ts(datetime.combine(from_, time.min)) if from_ else None
+    hi = fmt_ts(datetime.combine(to + timedelta(days=1), time.min)) if to else None
+    conn = db.connect()
+    try:
+        conn.execute("BEGIN")
+        try:
+            segments = build_segments(conn, mp=mp, meter=meter, lo=lo, hi=hi)
+            snap = snapshot_info(conn)
+        finally:
+            conn.execute("COMMIT")
+    finally:
+        conn.close()
+    return {
+        "segment_count": len(segments),
+        "segments": segments,
+        "snapshot": snap,
+        "instance": INSTANCE,
+    }
+
+
 # ---------------------------------------------------------------- 数据查看
 
 @app.get("/api/health")
@@ -336,6 +417,7 @@ def root():
         "docs": "/docs",
         "endpoints": ["/api/imports/readings", "/api/imports/meter-changes",
                       "/api/settlement/daily", "/api/settlement/range",
+                      "/api/meter-cross-checks", "/api/meter-segments",
                       "/api/metering-points", "/api/readings", "/api/meter-changes",
                       "/api/imports", "/api/health"],
     }
