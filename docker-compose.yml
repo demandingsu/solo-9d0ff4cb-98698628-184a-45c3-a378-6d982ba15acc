@@ -1,0 +1,41 @@
+# 两个 API 实例共享同一 SQLite 库文件（named volume），演示并发导入与查询。
+# 启动: docker compose up --build
+#   api1 -> http://localhost:8001/docs
+#   api2 -> http://localhost:8002/docs
+services:
+  api1:
+    build: .
+    image: campus-energy-api
+    ports:
+      - "8001:8000"
+    environment:
+      DB_PATH: /data/energy.db
+      INSTANCE_NAME: api1
+    volumes:
+      - energy-data:/data
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://localhost:8000/api/health', timeout=3)"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 5s
+
+  api2:
+    build: .
+    image: campus-energy-api
+    ports:
+      - "8002:8000"
+    environment:
+      DB_PATH: /data/energy.db
+      INSTANCE_NAME: api2
+    volumes:
+      - energy-data:/data
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://localhost:8000/api/health', timeout=3)"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 5s
+
+volumes:
+  energy-data:
